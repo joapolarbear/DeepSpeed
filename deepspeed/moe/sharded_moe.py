@@ -183,7 +183,7 @@ def top1gating(logits: Tensor,
                noisy_gate_policy: Optional[str] = None,
                drop_tokens: bool = True,
                use_rts: bool = True,
-               use_tutel: bool = False) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+               use_tutel: bool = False) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Implements Top1Gating on logits."""
     if noisy_gate_policy == 'RSample':
         logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
@@ -197,6 +197,8 @@ def top1gating(logits: Tensor,
     indices1_s = torch.argmax(logits_w_noise if noisy_gate_policy == 'RSample' else gates, dim=1)
     num_experts = int(gates.shape[1])
     mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+
+    origin_mask = mask1
 
     # mask only used tokens
     if used_token is not None:
@@ -271,7 +273,7 @@ def top1gating(logits: Tensor,
 
     dispatch_mask = combine_weights.bool()
 
-    return l_aux, combine_weights, dispatch_mask, exp_counts
+    return l_aux, combine_weights, dispatch_mask, exp_counts, origin_mask.detach().cpu(), mask1.detach().cpu()
 
 
 def top2gating(logits: Tensor, capacity_factor: float, min_capacity: int) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -465,6 +467,11 @@ class MOELayer(Base):
         elif use_tutel and TUTEL_INSTALLED and gate.k != 1:
             logger.warning("To enable Tutel optimization, use top-1 instead of top-2 gate. "
                            "Proceeding without Tutel.")
+            
+        self.profile = True
+        self.step = 0
+        self.route_history_wo_drop = []
+        self.route_history_w_drop = []
 
     def _set_ep_group(self, ep_group):
         self.ep_group = ep_group
@@ -482,8 +489,10 @@ class MOELayer(Base):
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
 
+        assert self.gate.k == 1, "only support top-1 gate currently"
         if self.use_tutel:
-            self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
+            self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts,\
+                mask_wo_drop, mask_w_drop = self.gate(reshaped_input, input[1], True)
             S, M = reshaped_input.size(0), reshaped_input.size(1)
 
             if not hasattr(self, '_tutel_dispatcher'):
@@ -491,9 +500,10 @@ class MOELayer(Base):
             self._tutel_dispatcher.update(indices_, locations_, gates_, capacity=C)
             dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
         else:
-            self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+            self.l_aux, combine_weights, dispatch_mask, self.exp_counts,\
+                mask_wo_drop, mask_w_drop = self.gate(reshaped_input, input[1])
             dispatched_input = einsum("sec,sm->ecm", dispatch_mask.type_as(input[0]), reshaped_input)
-
+    
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()
 
@@ -546,4 +556,9 @@ class MOELayer(Base):
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False)
 
+        if self.profile:
+            self.route_history_w_drop.append(mask_w_drop)
+            self.route_history_wo_drop.append(mask_wo_drop)
+            print(mask_wo_drop - mask_w_drop)
+            self.step += 1
         return a
