@@ -559,6 +559,6 @@ class MOELayer(Base):
         if self.profile:
             self.route_history_w_drop.append(mask_w_drop)
             self.route_history_wo_drop.append(mask_wo_drop)
-            print(mask_wo_drop - mask_w_drop)
+            # print(mask_wo_drop - mask_w_drop)
             self.step += 1
         return a
